@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 class MLP(nn.Module):
 
-    def __init__(self, input_dim=25):
+    def __init__(self, input_dim=25, out_dim=2):
         '''
         Descriptions:
             The teacher network is used for data scheduling, and it is a
@@ -29,7 +29,7 @@ class MLP(nn.Module):
         super(MLP, self).__init__()
         self.fc0 = nn.Linear(input_dim, 25)  # 12 is selected by the paper.
         self.fc1 = nn.Linear(25, 12)
-        self.fc2 = nn.Linear(12, 2)
+        self.fc2 = nn.Linear(12, out_dim)
         self.init_weights()
         self.saved_log_probs = []
         self.reward_T_histtory = []
@@ -55,6 +55,52 @@ class MLP(nn.Module):
         out = self.fc2(out)
         out = F.softmax(out, dim=1)
         return out
+
+
+class MLP_LR(nn.Module):
+    def __init__(self, input_dim=4, out_dim=2):
+        '''
+        Descriptions:
+            e.g. for cifar-10 dataset:
+                                    a). layer feature: rank of the layer
+                                    b). Model feature: 3-dim, [current_iter_num, avg_train_loss, best_val_loss].
+                                        Note: All three signals are respectively divided by pre-defined maximum number
+                                        to constrain their values in the interval [0,1].
+            In section 7.3.2: the authors studied the importance of different features, surprisingly, the Model feature
+            and combined feature are most important.
+
+            Teaching Strategies: collect M samples before updating the base neural network.
+        :param configs:
+            1. input_dim: int (for cifar-10&mnist, d = 4: 1 layer feature + 3 model features)
+        '''
+        super(MLP_LR, self).__init__()
+        self.fc0 = nn.Linear(input_dim, 4)
+        self.fc1 = nn.Linear(4, out_dim)
+        self.init_weights()
+        self.saved_log_probs = []
+        self.reward_T_histtory = []
+        self.rewards = []
+        self.rewards_baseline = 0.0
+
+    def init_weights(self):
+        scale = 0.01
+        self.fc0.weight.data.uniform_(-scale, scale)
+        self.fc0.bias.data.fill_(0)
+        self.fc1.weight.data.uniform_(-scale, scale)
+        self.fc1.bias.data.fill_(2)
+        # for not filtering too much data in the early stage
+        # refer to section 8.2 for details.
+
+    def forward(self, x):
+        out = self.fc0(x)
+        out =torch.tanh(out)
+        out = self.fc1(out)
+        out = F.softmax(out, dim=1)
+        return out
+
+
+def teacher_mlp_lr():
+    return MLP_LR(input_dim=4, out_dim=2)
 
 
 def teacher_mlp():
