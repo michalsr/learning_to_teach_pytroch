@@ -370,6 +370,8 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     config = {
         'tau': args.tau,
+        'epoch_num_per_traj': args.epoch_num_per_traj,
+        'traj_num_per_episode': args.traj_num_per_episode,
         'max_iter': 10000,
         'batch_size': args.batch_size,
         'max_non_increasing_steps': 5,
