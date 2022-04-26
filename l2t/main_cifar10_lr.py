@@ -213,6 +213,7 @@ def train_l2t(teacher_model, student_model):
             training_loss_history = deque(maxlen=100)
             val_acc_history = []
             student_updates = 0
+            
 
             for i_epoch in trange(config['epoch_num_per_traj']):
                 for idx, (inputs, labels) in enumerate(dataloader['teacher_train_loader']):
