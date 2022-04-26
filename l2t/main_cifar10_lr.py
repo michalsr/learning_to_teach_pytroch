@@ -6,7 +6,7 @@ import torch.optim as optim
 from torch.distributions import Categorical
 
 
-from network.teacher_model.teacher_mlp import teacher_mlp
+from network.teacher_model.teacher_mlp import teacher_mlp_lr
 from network.student_model.resnet import resnet32, _weights_init
 from dataset.data_loader import data_loader_func
 from utils.setseed import setup_seed
@@ -33,6 +33,8 @@ def state_func(state_config, total_layers=4):
     avg_train_loss = state_config['avg_train_loss']
 
     state_feactues = torch.zeros((total_layers, 3)).to(device)
+    # print(state_feactues.dtype)
+    # print(avg_val_acc)
     # print(average_train_loss)
     state_feactues[range(total_layers), 0] = avg_train_loss / max_loss
     state_feactues[range(total_layers), 1] = avg_val_acc
@@ -102,7 +104,7 @@ def val_student(model, dataloader, device):
         val_loss = running_loss / total
         val_acc = running_corrects.double() / total
 
-    return val_loss, val_acc
+    return val_loss, val_acc.item()
 
 
 def student_lr_scheduler_cifar10(optimizer, iterations):
@@ -133,19 +135,19 @@ def teacher_lr_scheduler(optimizer, iterations):
         param_group['lr'] = lr
 
 
-def update_teacher_by_optimizer(optimizer):
+def update_teacher_by_optimizer(optimizer, device):
     tensor_reward = []
     loss_values = []
     rewards = teacher_model.rewards
     normalized_reward = []
 
-    mean = np.mean(rewards)
+    mean = torch.mean(torch.tensor(rewards))
     for i in range(len(rewards)):
         normalized_reward.append(rewards[i] - mean)
 
     for r in normalized_reward:
         tensor_reward.insert(int(r.item()), normalized_reward[int(r.item())])
-    tensor_reward = torch.tensor(tensor_reward)
+    tensor_reward = torch.tensor(tensor_reward).to(device)
     for log_prob, reward in zip(teacher_model.saved_log_probs, tensor_reward):
         r = -log_prob * reward
 
@@ -168,15 +170,15 @@ def select_action(state):
     return action
 
 
-def train_l2t():
+def train_l2t(teacher_model, student_model):
     teacher_optimizer = optim.Adam(teacher_model.parameters(), lr=0.001, weight_decay=0)
     best_avg_val_acc = 0.
     best_student_model = copy.deepcopy(student_model)
 
     best_avg_training_loss = config['max_loss']
 
-    lr_current = torch.tensor([0.001] * len(layer_list), dtype=torch.float32)
-    lr_last = lr_current
+    # lr_current = torch.tensor([0.001] * len(layer_list), dtype=torch.float32)
+    lr_last = torch.ones(len(layer_list)) * 0.001
 
     for i_episode in trange(config['train_episode']):
 
@@ -189,11 +191,12 @@ def train_l2t():
             'device': device
         }
 
-        state = state_func(state_config)
+        state = state_func(state_config, total_layers=len(layer_list))
+        initialized_student_model_this_traj = copy.deepcopy(best_student_model)
 
         for i_traj in trange(config['traj_num_per_episode']):
             # for each trajectory, reinitialize student model with the previous best student model
-            student_model = copy.deepcopy(best_student_model)
+            student_model = copy.deepcopy(initialized_student_model_this_traj)
 
             # the teacher select action according to the state feature
             action = select_action(state)
@@ -204,7 +207,7 @@ def train_l2t():
             lr_configs = create_configs_predefined(layer_list, lr_list=lr_current.numpy().tolist())
             confs, names = group_wise_lr(student_model, lr_configs)
 
-            optimizer = optim.SGD(confs, lr=0.1, momentum=0.9, weight_decay=1e-4)
+            optimizer = optim.SGD(confs, lr=0.001, momentum=0.9, weight_decay=1e-4)
 
             # initialize states statistics
             training_loss_history = deque(maxlen=100)
@@ -238,7 +241,6 @@ def train_l2t():
             # at the end of training each trajectory, collect training supervision for the teacher
             avg_val_acc = sum(val_acc_history) / len(val_acc_history)
             teacher_model.rewards.append(avg_val_acc)
-            teacher_model.reward_T_histtory.append(avg_val_acc)
 
             print('Episode: {}, Trajectory: {}, Avg Val acc: {:.4f}'.format(i_episode, i_traj, avg_val_acc))
 
@@ -249,7 +251,7 @@ def train_l2t():
                 best_avg_training_loss = sum(training_loss_history) / len(training_loss_history)
 
         # after training multiple trajectories, update teacher and update lr
-        update_teacher_by_optimizer(teacher_optimizer)
+        update_teacher_by_optimizer(teacher_optimizer, device)
         lr_last = lr_current
 
 
@@ -283,7 +285,7 @@ def test_l2t():
                 'max_iter': config['max_iter'],
                 'device': device
             }
-            state = state_func(state_config)
+            state = state_func(state_config, total_layers=len(layer_list))
 
             # the teacher select action according to the state feature
             action = select_action(state)
@@ -359,7 +361,6 @@ if __name__ == '__main__':
     parser.add_argument('--traj_num_per_episode', type=int, default=8)
     parser.add_argument('--epoch_num_per_traj', type=int, default=20)
     parser.add_argument('--lr_increment', type=float, default=0.0002)
-    parser.add_argument('--train_episode', type=int, default=300)
     parser.add_argument('--test_epoch', type=int, default=540)
     parser.add_argument('--num_effective_data', type=int, default=4500000)
     args = parser.parse_args()
@@ -376,6 +377,9 @@ if __name__ == '__main__':
         'num_classes': 10,
         'max_loss': 15,
         'train_episode': args.train_episode,
+        'traj_num_per_episode': args.traj_num_per_episode,
+        'epoch_num_per_traj': args.epoch_num_per_traj,
+        'lr_increment': args.lr_increment,
         'test_episode': args.test_epoch,
         'num_effective_data': args.num_effective_data,
         'path_to_dataset': './data',
@@ -385,15 +389,13 @@ if __name__ == '__main__':
         'student_save_dir': './result/l2t/student',
         'student_save_model': 'student_step2_cifar10.pth'
     }
-    teacher_model = teacher_mlp().to(device)
+    teacher_model = teacher_mlp_lr().to(device)
     student_model = resnet32().to(device)
 
     for name, param in student_model.named_parameters():
         print(name)
 
-    input()
-
-    layer_list = []  # TODO: add in contents
+    layer_list = ['layer1', 'layer2', 'layer3']  # TODO: add in contents
 
     lr_config_list = create_configs_predefined(layer_list, lr_list=[0.001] * len(layer_list))
 
@@ -403,7 +405,7 @@ if __name__ == '__main__':
 
     print('Training the teacher starts....................')
     start = time.time()
-    train_l2t()
+    train_l2t(teacher_model, student_model)
     time_train = time.time() - start
 
     print('Saving the teahcer model........................')

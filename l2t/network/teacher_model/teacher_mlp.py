@@ -74,8 +74,8 @@ class MLP_LR(nn.Module):
             1. input_dim: int (for cifar-10&mnist, d = 4: 1 layer feature + 3 model features)
         '''
         super(MLP_LR, self).__init__()
-        self.fc0 = nn.Linear(input_dim, 4)
-        self.fc1 = nn.Linear(4, out_dim)
+        self.fc0 = nn.Linear(input_dim, 3)
+        self.fc1 = nn.Linear(3, out_dim)
         self.init_weights()
         self.saved_log_probs = []
         self.reward_T_histtory = []
@@ -100,7 +100,7 @@ class MLP_LR(nn.Module):
 
 
 def teacher_mlp_lr():
-    return MLP_LR(input_dim=4, out_dim=2)
+    return MLP_LR(input_dim=3, out_dim=2)
 
 
 def teacher_mlp():
