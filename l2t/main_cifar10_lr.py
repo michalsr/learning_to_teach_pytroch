@@ -21,6 +21,7 @@ import numpy as np
 from utils.reset_lr import group_wise_lr, create_configs_predefined
 
 from collections import deque
+from pathlib import Path
 
 
 np.set_printoptions(threshold=np.inf)
@@ -171,8 +172,8 @@ def select_action(state):
 
 
 def check_if_decreasing(acc_list):
-    out = np.array(acc_list) - acc_list[0]
-    if (out[1:] < 0).sum() == 0:
+    out = np.array(acc_list) - acc_list[-1]
+    if (out[:-1] < 0).sum() == 0:
         return True
     return False
 
@@ -203,6 +204,9 @@ def train_l2t(teacher_model, student_model):
 
         state = state_func(state_config, total_layers=len(layer_list))
         initialized_student_model_this_traj = copy.deepcopy(best_student_model)
+
+        for i, lr in enumerate(lr_last):
+            writer.add_scalar(f'train_teacher/lr{i}', lr.item(), i_episode)
 
         for i_traj in trange(config['traj_num_per_episode']):
             # for each trajectory, reinitialize student model with the previous best student model
@@ -257,7 +261,8 @@ def train_l2t(teacher_model, student_model):
             avg_val_acc = sum(val_acc_history) / len(val_acc_history)
             teacher_model.rewards.append(avg_val_acc)
 
-            print('Episode: {}, Trajectory: {}, Avg Val acc: {:.4f}'.format(i_episode, i_traj, avg_val_acc))
+            print('Episode: {}, Trajectory: {}, Avg Val acc: {:.4f}'.format(i_episode, i_traj, avg_val_acc),
+                  file=text_log_file, flush=True)
 
             # update best states
             if avg_val_acc > best_avg_val_acc:
@@ -267,6 +272,8 @@ def train_l2t(teacher_model, student_model):
                 lr_best = lr_current
 
         best_avg_val_acc_for_episode_queue.append(best_avg_val_acc)
+
+        writer.add_scalar(f'train_teacher/best_avg_val_acc', best_avg_val_acc, i_episode)
 
         # after training multiple trajectories, update teacher and update lr
         update_teacher_by_optimizer(teacher_optimizer, device)
@@ -285,122 +292,145 @@ def train_l2t(teacher_model, student_model):
     print("End of training teacher!", file=text_log_file, flush=True)
 
 
-def test_l2t():
-    training_loss_history = []
-    best_loss_on_dev = config['max_loss']
-    student_updates = 0
-    i_iter = 0
-    input_pool = []
-    label_pool = []
-    done = False
-    count_sampled = 0
-    num_effective_data = 0
-    test_acc_list = []
+def test_l2t(teacher_model, student_model):
+    teacher_model.eval()
     # init the student
     student_model.apply(_weights_init)
 
-    for epoch in trange(config['test_episode']):
-        for idx, (inputs, labels) in enumerate(dataloader['student_train_loader']):
+    best_avg_val_acc = 0.
+    best_student_model = copy.deepcopy(student_model)
+    best_avg_training_loss = config['max_loss']
 
-            # compute the state feature
-            state_config = {
-                'inputs': inputs.to(device),
-                'labels': labels.to(device),
-                'num_class': config['num_classes'],
-                'student_iter': student_updates,
-                'training_loss_history': training_loss_history,
-                'best_loss_on_dev': best_loss_on_dev,
-                'model': student_model,
-                'max_loss': config['max_loss'],
-                'max_iter': config['max_iter'],
-                'device': device
-            }
-            state = state_func(state_config, total_layers=len(layer_list))
+    # lr_current = torch.tensor([0.001] * len(layer_list), dtype=torch.float32)
+    lr_last = torch.ones(len(layer_list)) * 0.01
+    lr_best = lr_last
 
-            # the teacher select action according to the state feature
-            action = select_action(state)
+    non_increasing_step = 0
 
-            # finish one step
-            i_iter += 1
+    for i_episode in trange(config['test_episode']):
+        # compute the state feature
+        state_config = {
+            'avg_train_loss': best_avg_training_loss,
+            'avg_val_acc': best_avg_val_acc,
+            'max_loss': config['max_loss'],
+            'max_iter': config['max_iter'],
+            'device': device
+        }
 
-            # collect data to train student
-            indices = torch.nonzero(action)
-            if len(indices) == 0:
-                continue
+        state = state_func(state_config, total_layers=len(layer_list))
+        # the teacher select action according to the state feature
+        action = select_action(state)
 
-            count_sampled += len(indices)
-            selected_inputs = inputs[indices.squeeze()].view(len(indices), *inputs.size()[1:])
-            selected_labels = labels[indices.squeeze()].view(-1, 1)
-            input_pool.append(selected_inputs)
-            label_pool.append(selected_labels)
+        # 0 means decrease learning rate, 1 means increase learning rate
+        lr_current = lr_last + ((2 * action - 1) * config['lr_increment']).cpu()
+        print('Episode: {}, the lr before clamp is {}'.format(
+            i_episode, lr_current), file=text_log_file, flush=True)
+        lr_current.clamp_(min=0.00001, max=0.1)
+        print('Episode: {}, the lr after clamp is {}'.format(
+            i_episode, lr_current), file=text_log_file, flush=True)
 
-            if count_sampled >= config['batch_size']:
-                inputs = torch.cat(input_pool, 0)[:config['batch_size']]
-                labels = torch.cat(label_pool, 0)[:config['batch_size']].squeeze()
+        for i, lr in enumerate(lr_current):
+            writer.add_scalar(f'train_student/lr{i}', lr.item(), i_episode)
 
-                input_pool = []
-                label_pool = []
-                count_sampled = 0
+        lr_configs = create_configs_predefined(layer_list, lr_list=lr_current.numpy().tolist())
+        confs, names = group_wise_lr(student_model, lr_configs)
 
+        optimizer = optim.SGD(confs, lr=0.001, momentum=0.9, weight_decay=1e-4)
+
+        # initialize states statistics
+        training_loss_history = deque(maxlen=100)
+        val_acc_history = []
+        student_updates = 0
+
+        for i_epoch in trange(config['epoch_num_per_traj']):
+            for idx, (inputs, labels) in enumerate(dataloader['student_train_loader']):
                 train_student_config = {
                     'inputs': inputs,
                     'labels': labels,
                     'model': student_model,
                     'device': device,
-                    'optimizer': optim.SGD(student_model.parameters(), lr=0.1, momentum=0.9,
-                                           weight_decay=0.0001)
+                    'optimizer': optimizer
                 }
 
                 # train the student
                 train_loss, train_acc = train_student(train_student_config)
+
                 training_loss_history.append(train_loss)
                 student_updates += 1
-                num_effective_data += inputs.size(0)
-                student_lr_scheduler_cifar10(train_student_config['optimizer'], student_updates)
-
-                # val the student on validation set
-                val_loss, val_acc = val_student(student_model, dataloader['dev_loader'], device)
-                best_loss_on_dev = val_loss if val_loss < best_loss_on_dev else best_loss_on_dev
-
-                # test on the test set
-                test_loss, test_acc = val_student(student_model, dataloader['test_loader'], device)
-                test_acc_list.append(test_acc)
 
                 print(
-                    'Test: epoch: {}, student_iter: {}, train loss: {:.4f}, train acc: {:.4f}, val loss: {:.4f}, val acc: {:.4f}'.format(
-                        epoch, student_updates, train_loss, train_acc, val_loss, val_acc))
-                print('Test: epoch{}, student_iter: {}, test loss: {:.4f}, test acc: {:.4f}'.format(epoch, student_updates, test_loss,
-                                                                                           test_acc))
-                writer.add_scalars('test_l2t/train', {'train_loss': train_loss, 'train_acc': train_acc},
-                                   student_updates)
-                writer.add_scalars('test_l2t/val', {'val_loss': val_loss, 'val_acc': val_acc}, student_updates)
-                writer.add_scalars('test_l2t/test', {'test_loss': test_loss, 'test_acc': test_acc}, num_effective_data)
+                    'Episode: {}, Epoch: {}, Student_iter: {}, Train loss: {:.4f}, Train acc: {:.4f}'.format(
+                        i_episode, i_epoch, student_updates, train_loss, train_acc))
 
-                if num_effective_data >= config['num_effective_data']:
-                    return
+                # val the student on validation set
+            val_loss, val_acc = val_student(student_model, dataloader['dev_loader'], device)
+            val_acc_history.append(val_acc)
 
+        # at the end of training each trajectory, collect training supervision for the teacher
+        avg_val_acc = sum(val_acc_history) / len(val_acc_history)
+
+        print('Episode: {}, Avg Val acc: {:.4f}'.format(i_episode, avg_val_acc), file=text_log_file, flush=True)
+
+        # update best states
+        if avg_val_acc > best_avg_val_acc:
+            best_student_model = copy.deepcopy(student_model)
+            best_avg_val_acc = avg_val_acc
+            best_avg_training_loss = sum(training_loss_history) / len(training_loss_history)
+            lr_best = lr_current
+            non_increasing_step = 0
+        else:
+            non_increasing_step += 1
+
+        writer.add_scalar(f'train_student/best_avg_val_acc', best_avg_val_acc, i_episode)
+
+        torch.save(best_student_model.state_dict(), os.path.join(config['student_save_dir'], 'student_best_test.pth'))
+
+        print('After episode: {}, the avg training loss is {}, the avg val accuracy is {}, the best lr is {}'.format(
+            i_episode, best_avg_training_loss, best_avg_val_acc, lr_best), file=text_log_file, flush=True)
+
+        if non_increasing_step > 5:
+            print(f"Non decreasing for 5 episodes! Stop training now after episode {i_episode}", file=text_log_file,
+                  flush=True)
+            break
+
+    print("End of training student!", file=text_log_file, flush=True)
     return
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Learning to teach')
-    parser.add_argument('--tau', type=float, default=0.80)
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--train_episode', type=int, default=300)
     parser.add_argument('--traj_num_per_episode', type=int, default=8)
     parser.add_argument('--epoch_num_per_traj', type=int, default=20)
     parser.add_argument('--lr_increment', type=float, default=0.0002)
-    parser.add_argument('--test_epoch', type=int, default=540)
-    parser.add_argument('--num_effective_data', type=int, default=4500000)
+    parser.add_argument('--test_epoch', type=int, default=300)
+    parser.add_argument('--exp_name', type=str, default='cifar10_adjust_lr')
+    parser.add_argument('--save_dir', type=str, default='./outputs')
+    parser.add_argument('--log_dir', type=str, default='./logs')
     args = parser.parse_args()
 
     # set seed
     setup_seed(args.seed)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # create folders
+    exp_dir = Path(args.save_dir, args.exp_name)
+    if not exp_dir.exists():
+        exp_dir.mkdir(parents=True, exist_ok=True)
+    teacher_model_save_dir = exp_dir.joinpath('teacher')
+    if not teacher_model_save_dir.exists():
+        teacher_model_save_dir.mkdir(exist_ok=True)
+
+    student_model_save_dir = exp_dir.joinpath('student')
+    if not student_model_save_dir.exists():
+        student_model_save_dir.mkdir(exist_ok=True)
+
+    log_dir = Path(args.log_dir, args.exp_name)
+    if not log_dir.exists():
+        log_dir.mkdir(parents=True, exist_ok=True)
+
     config = {
-        'tau': args.tau,
         'lr_increment': args.lr_increment,
         'traj_num_per_episode': args.traj_num_per_episode,
         'epoch_num_per_traj': args.epoch_num_per_traj,
@@ -411,31 +441,21 @@ if __name__ == '__main__':
         'max_loss': 15,
         'train_episode': args.train_episode,
         'test_episode': args.test_epoch,
-        'num_effective_data': args.num_effective_data,
         'path_to_dataset': './data',
-        'tensorboard_save_path': './runs/l2t_cifar10',
-        'teacher_save_dir': './result/l2t/teacher',
+        'tensorboard_save_path': log_dir,
+        'teacher_save_dir': teacher_model_save_dir,
         'teacher_save_model': 'teacher_step1_cifar10.pth',
-        'student_save_dir': './result/l2t/student',
+        'student_save_dir': student_model_save_dir,
         'student_save_model': 'student_step2_cifar10.pth',
-        'log_dirs': './logs'
+        'log_dirs': log_dir,
     }
+
+    text_log_file = open(exp_dir.joinpath('log.txt'), 'a')
+    writer = SummaryWriter(config['tensorboard_save_path'])
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     teacher_model = teacher_mlp_lr().to(device)
     student_model = resnet32().to(device)
-
-    print('Saving the teacher model........................')
-    teacher_model_save_dir = config['teacher_save_dir']
-    if not os.path.exists(teacher_model_save_dir):
-        os.makedirs(teacher_model_save_dir)
-
-    student_model_save_dir = config['student_save_dir']
-    if not os.path.exists(student_model_save_dir):
-        os.makedirs(student_model_save_dir)
-
-    if not os.path.exists(config['log_dirs']):
-        os.makedirs(config['log_dirs'], exist_ok=True)
-
-    text_log_file = open(os.path.join(config['log_dirs'], 'log.txt'), 'a')
 
     for name, param in student_model.named_parameters():
         print(name)
@@ -446,8 +466,6 @@ if __name__ == '__main__':
 
     dataloader = data_loader_func(batch_sizes=config['batch_size'], path_to_dataset=config['path_to_dataset'])
 
-    writer = SummaryWriter(config['tensorboard_save_path'])
-
     print('Training the teacher starts....................')
     start = time.time()
     train_l2t(teacher_model, student_model)
@@ -455,18 +473,15 @@ if __name__ == '__main__':
 
     torch.save(teacher_model.state_dict(), os.path.join(teacher_model_save_dir, config['teacher_save_model']))
 
-    # print('Done.\nTesting the teacher.....................')
-    # print('Loading the teacher model')
-    # teacher_model.load_state_dict(torch.load(os.path.join(model_save_dir, config['teacher_save_model'])))
-    # start = time.time()
-    # test_l2t()
-    # time_test = time.time() - start
-    #
-    # print('Training complete in {:.0f}h {:.0f}m {:.0f}s'.format(time_train//3600, time_train // 60, time_train % 60))
-    # print('Testing complete in {:.0f}h {:.0f}m {:.0f}s'.format(time_test // 3600, time_test // 60, time_test % 60))
-    #
-    # print('Saving the student mdoel.......................')
-    # model_save_dir = './result/reinforce_cifar10/student'
-    # if not os.path.exists(model_save_dir):
-    #     os.makedirs(model_save_dir)
-    # torch.save(student_model.state_dict(), os.path.join(model_save_dir, config['student_save_model']))
+    print('Done.\nTesting the teacher.....................')
+    print('Loading the teacher model')
+    teacher_model.load_state_dict(torch.load(os.path.join(teacher_model_save_dir, config['teacher_save_model'])))
+    start = time.time()
+    test_l2t(teacher_model, student_model)
+    time_test = time.time() - start
+
+    print('Training complete in {:.0f}h {:.0f}m {:.0f}s'.format(time_train//3600, time_train // 60, time_train % 60))
+    print('Testing complete in {:.0f}h {:.0f}m {:.0f}s'.format(time_test // 3600, time_test // 60, time_test % 60))
+
+    print('Saving the student mdoel.......................')
+    torch.save(student_model.state_dict(), os.path.join(student_model_save_dir, config['student_save_model']))
